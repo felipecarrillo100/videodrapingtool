@@ -1,0 +1,26 @@
+{
+  "name": "videodrapingtool",
+  "version": "0.1.0",
+  "description": "Converts STANAG/KLV drone footage into a video-panorama-ready video.json + telemetry CSV + optimized mp4.",
+  "type": "module",
+  "bin": {
+    "videodrapingtool": "dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsc -p .",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@vidterra/misb.js": "^0.1.30",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
