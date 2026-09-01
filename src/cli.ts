@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { requireFfmpeg } from "./ffmpegBinary.js";
 import { extractKlvTrack, assertNonEmpty } from "./extractKlv.js";
 import { decodeSt0601Packets } from "./klv.js";
-import { buildTelemetryRows, findAllEmptyColumns, smoothAngles } from "./telemetry.js";
+import { buildTelemetryRows, collapseHeldPosition, findAllEmptyColumns, smoothAngles } from "./telemetry.js";
 import { writeTelemetryCsv } from "./csv.js";
 import { transcodeToOptimizedMp4 } from "./transcode.js";
 import { writeManifest } from "./manifest.js";
@@ -39,12 +39,17 @@ program
     "smooths yaw/pitch to remove sensor-update artifacts (\"beating\") — raise if beating persists, set to 0 to disable",
     "120",
   )
+  .option(
+    "--no-collapse-held-position",
+    "keep one row per decoded packet even when position hasn't changed (disables the fix for a freeze-then-teleport artifact, for comparison/debugging)",
+  )
   .addHelpText(
     "after",
     "\nExamples:\n" +
       "  $ videodrapingtool samples/day-flight.mpg -o out/day-flight\n" +
       "  $ videodrapingtool samples/internal.ts -o out/internal --smooth-angles 200   # stronger smoothing if beating persists\n" +
-      "  $ videodrapingtool samples/internal.ts -o out/internal --smooth-angles 0     # disable, compare against raw values\n\n" +
+      "  $ videodrapingtool samples/internal.ts -o out/internal --smooth-angles 0     # disable, compare against raw values\n" +
+      "  $ videodrapingtool samples/internal.ts -o out/internal --no-collapse-held-position   # keep raw per-packet position rows\n\n" +
       `Produces, in the given output directory:\n  ${VIDEO_FILENAME}        size-optimized re-encode of the source video\n` +
       `  ${TELEMETRY_FILENAME}    one row per decoded KLV packet: timestampMs,lon,lat,height,yaw,pitch,roll,fovX,fovY,targetLon,targetLat,targetElevation\n` +
       `  ${MANIFEST_FILENAME}       manifest pointing at the two files above\n`,
@@ -58,7 +63,16 @@ program
 
 async function run(
   inputVideoArg: string,
-  opts: { output: string; variant: string; syncOffset: string; crf: string; preset: string; fps: string; smoothAngles: string },
+  opts: {
+    output: string;
+    variant: string;
+    syncOffset: string;
+    crf: string;
+    preset: string;
+    fps: string;
+    smoothAngles: string;
+    collapseHeldPosition: boolean;
+  },
 ): Promise<void> {
   const inputVideo = resolve(inputVideoArg);
   const outputDir = resolve(opts.output);
@@ -91,8 +105,12 @@ async function run(
     const smoothWindowMs = Number(opts.smoothAngles);
     const { rows: smoothedRows, windowSamples, nominalSpacingMs } = smoothAngles(rows, smoothWindowMs);
 
+    const { rows: finalRows, droppedCount: heldPositionCount } = opts.collapseHeldPosition
+      ? collapseHeldPosition(smoothedRows)
+      : { rows: smoothedRows, droppedCount: 0 };
+
     console.log("Writing telemetry.csv...");
-    writeTelemetryCsv(join(outputDir, TELEMETRY_FILENAME), smoothedRows);
+    writeTelemetryCsv(join(outputDir, TELEMETRY_FILENAME), finalRows);
 
     console.log(`Transcoding video (crf=${opts.crf}, preset=${opts.preset}, fps=${opts.fps})...`);
     transcodeToOptimizedMp4(inputVideo, join(outputDir, VIDEO_FILENAME), {
@@ -110,7 +128,7 @@ async function run(
     });
 
     const videoSize = statSync(join(outputDir, VIDEO_FILENAME)).size;
-    console.log(`\nDone. ${smoothedRows.length} telemetry samples decoded, spanning ${(smoothedRows.at(-1)?.timestampMs ?? 0) / 1000}s.`);
+    console.log(`\nDone. ${finalRows.length} telemetry samples decoded, spanning ${(finalRows.at(-1)?.timestampMs ?? 0) / 1000}s.`);
     console.log(`  ${VIDEO_FILENAME}: ${(videoSize / 1024 / 1024).toFixed(1)} MB`);
     if (skippedCount > 0) {
       console.log(`  Skipped ${skippedCount} non-positional packet(s) (no Sensor Latitude/Longitude) sharing a timestamp with a real sample.`);
@@ -119,6 +137,12 @@ async function run(
       console.log(`  Smoothed yaw/pitch: window=${smoothWindowMs}ms (~${windowSamples} samples at this file's ~${nominalSpacingMs.toFixed(1)}ms spacing).`);
     } else {
       console.log(`  Yaw/pitch smoothing disabled (--smooth-angles 0).`);
+    }
+    if (heldPositionCount > 0) {
+      const avgSpacingMs = finalRows.length > 1 ? finalRows.at(-1)!.timestampMs / finalRows.length : 0;
+      console.log(`  Collapsed ${heldPositionCount} held-position packet(s) into their real update boundaries (~${avgSpacingMs.toFixed(0)}ms avg spacing).`);
+    } else if (!opts.collapseHeldPosition) {
+      console.log(`  Held-position collapsing disabled (--no-collapse-held-position).`);
     }
     if (emptyColumns.length > 0) {
       console.log(`  Note: these columns were empty across every packet: ${emptyColumns.join(", ")}`);

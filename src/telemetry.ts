@@ -247,3 +247,37 @@ export function smoothAngles(rows: readonly TelemetryRow[], windowMs: number): S
   });
   return { rows: smoothed, windowSamples, nominalSpacingMs };
 }
+
+export interface CollapseHeldPositionResult {
+  readonly rows: readonly TelemetryRow[];
+  readonly droppedCount: number;
+}
+
+/**
+ * `Sensor Latitude/Longitude/True Altitude` only genuinely update roughly every ~227ms in the real
+ * customer file — the raw KLV just repeats the last known value, bit-for-bit, for the packets in between
+ * (confirmed: held values repeat identically, not approximately). Writing one row per packet regardless
+ * makes the client's interpolator think a real update just happened every 20ms, so it renders "frozen" for
+ * ~200ms then crams the whole real displacement into the one genuine 20ms transition — a ~10x-too-fast
+ * burst, confirmed across the whole file (89.7% of steps frozen, the rest averaging 10x real speed).
+ *
+ * Collapses consecutive rows whose `lat`/`lon`/`height` are ALL exactly unchanged from the previous KEPT
+ * row down to just the first occurrence of each distinct value — the same "sparse real samples, real
+ * gaps" shape `day-flight.mpg`'s own 6-packet file already has, which the client's interpolation already
+ * handles correctly (its own comments note real gaps up to 98 seconds). Scoped to position only, same
+ * "only touch what's diagnosed as broken" reasoning as `smoothAngles` — `yaw`/`pitch`/`roll`/`fovX`/`fovY`
+ * on a dropped row are discarded along with it, which is fine: those signals already interpolate/smooth
+ * acceptably at coarser sampling (the same day/night files this reasoning cites have only 6/18 total
+ * samples for their ENTIRE flight and already track correctly).
+ */
+export function collapseHeldPosition(rows: readonly TelemetryRow[]): CollapseHeldPositionResult {
+  if (rows.length === 0) return { rows, droppedCount: 0 };
+  const kept: TelemetryRow[] = [rows[0]!];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i]!;
+    const last = kept[kept.length - 1]!;
+    if (row.lat === last.lat && row.lon === last.lon && row.height === last.height) continue;
+    kept.push(row);
+  }
+  return { rows: kept, droppedCount: rows.length - kept.length };
+}

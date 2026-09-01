@@ -37,6 +37,8 @@ Options:
   --fps <n>               frame rate for the re-encode (default: "30")
   --smooth-angles <ms>    smooths yaw/pitch to remove sensor-update artifacts ("beating") — raise if
                           beating persists, set to 0 to disable (default: "120")
+  --no-collapse-held-position   keep one row per decoded packet even when position hasn't changed
+                          (disables the fix below, for comparison/debugging)
 ```
 
 **On `--smooth-angles`**: some sources' `Sensor Latitude/Longitude` and `Frame Center Latitude/Longitude`
@@ -50,6 +52,20 @@ this artifact) to remove it, on by default since it's a strict improvement with 
 sources that don't exhibit the artifact. The window is in milliseconds, not a raw sample count, so it
 means the same real time span regardless of a source's native packet rate; pass `0` to compare against raw
 values.
+
+**On `--collapse-held-position`**: some sources' `Sensor Latitude/Longitude/True Altitude` genuinely update
+far slower than the packet rate (confirmed on a real customer file: ~4.4Hz, once every ~227ms, against a
+50Hz packet stream) — the raw KLV just repeats the last known value, bit-for-bit, for the packets in
+between. Writing one row per packet regardless makes a consumer's interpolation think a real update just
+happened every packet, so it renders the position frozen for ~200ms then crams the *entire* real
+displacement into the one genuine transition where the value actually changes — confirmed on that same
+file: 89.7% of steps showed zero motion, the rest averaging 10x the aircraft's real speed. This is not a
+tradeoff against accuracy; it's a correction toward it — the current per-packet behavior already
+misrepresents position for 90% of the time (frozen and growing staler right up to the snap), while
+collapsing repeated rows down to their real update boundaries lets a linear interpolation (the standard
+technique flight-radar/ADS-B displays already use for exactly this) bridge the *real* gap with the *real*
+values, matching the ground truth exactly at both endpoints instead of only one. On by default; pass
+`--no-collapse-held-position` to compare against the raw per-packet rows.
 
 **On the defaults**: the source video's own codec is typically already H.264 — re-encoding to H.264 again
 doesn't shrink anything on its own, only the bitrate/CRF/framerate choices do. Measured on the real sample
