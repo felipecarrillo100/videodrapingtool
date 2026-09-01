@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { requireFfmpeg } from "./ffmpegBinary.js";
 import { extractKlvTrack, assertNonEmpty } from "./extractKlv.js";
 import { decodeSt0601Packets } from "./klv.js";
-import { buildTelemetryRows, findAllEmptyColumns } from "./telemetry.js";
+import { buildTelemetryRows, findAllEmptyColumns, smoothAngles } from "./telemetry.js";
 import { writeTelemetryCsv } from "./csv.js";
 import { transcodeToOptimizedMp4 } from "./transcode.js";
 import { writeManifest } from "./manifest.js";
@@ -34,9 +34,17 @@ program
     "frame rate for the re-encode — most source drone footage is 60fps, which buys nothing for slowly-panning aerial footage viewed as a map texture",
     "30",
   )
+  .option(
+    "--smooth-angles <ms>",
+    "smooths yaw/pitch to remove sensor-update artifacts (\"beating\") — raise if beating persists, set to 0 to disable",
+    "120",
+  )
   .addHelpText(
     "after",
-    "\nExample:\n  $ videodrapingtool samples/day-flight.mpg -o out/day-flight\n\n" +
+    "\nExamples:\n" +
+      "  $ videodrapingtool samples/day-flight.mpg -o out/day-flight\n" +
+      "  $ videodrapingtool samples/internal.ts -o out/internal --smooth-angles 200   # stronger smoothing if beating persists\n" +
+      "  $ videodrapingtool samples/internal.ts -o out/internal --smooth-angles 0     # disable, compare against raw values\n\n" +
       `Produces, in the given output directory:\n  ${VIDEO_FILENAME}        size-optimized re-encode of the source video\n` +
       `  ${TELEMETRY_FILENAME}    one row per decoded KLV packet: timestampMs,lon,lat,height,yaw,pitch,roll,fovX,fovY,targetLon,targetLat,targetElevation\n` +
       `  ${MANIFEST_FILENAME}       manifest pointing at the two files above\n`,
@@ -50,7 +58,7 @@ program
 
 async function run(
   inputVideoArg: string,
-  opts: { output: string; variant: string; syncOffset: string; crf: string; preset: string; fps: string },
+  opts: { output: string; variant: string; syncOffset: string; crf: string; preset: string; fps: string; smoothAngles: string },
 ): Promise<void> {
   const inputVideo = resolve(inputVideoArg);
   const outputDir = resolve(opts.output);
@@ -77,10 +85,14 @@ async function run(
     }
 
     const rows = buildTelemetryRows(packets);
+    const skippedCount = packets.length - rows.length;
     const emptyColumns = findAllEmptyColumns(rows);
 
+    const smoothWindowMs = Number(opts.smoothAngles);
+    const { rows: smoothedRows, windowSamples, nominalSpacingMs } = smoothAngles(rows, smoothWindowMs);
+
     console.log("Writing telemetry.csv...");
-    writeTelemetryCsv(join(outputDir, TELEMETRY_FILENAME), rows);
+    writeTelemetryCsv(join(outputDir, TELEMETRY_FILENAME), smoothedRows);
 
     console.log(`Transcoding video (crf=${opts.crf}, preset=${opts.preset}, fps=${opts.fps})...`);
     transcodeToOptimizedMp4(inputVideo, join(outputDir, VIDEO_FILENAME), {
@@ -98,8 +110,16 @@ async function run(
     });
 
     const videoSize = statSync(join(outputDir, VIDEO_FILENAME)).size;
-    console.log(`\nDone. ${packets.length} packets decoded, spanning ${(rows.at(-1)?.timestampMs ?? 0) / 1000}s.`);
+    console.log(`\nDone. ${smoothedRows.length} telemetry samples decoded, spanning ${(smoothedRows.at(-1)?.timestampMs ?? 0) / 1000}s.`);
     console.log(`  ${VIDEO_FILENAME}: ${(videoSize / 1024 / 1024).toFixed(1)} MB`);
+    if (skippedCount > 0) {
+      console.log(`  Skipped ${skippedCount} non-positional packet(s) (no Sensor Latitude/Longitude) sharing a timestamp with a real sample.`);
+    }
+    if (smoothWindowMs > 0) {
+      console.log(`  Smoothed yaw/pitch: window=${smoothWindowMs}ms (~${windowSamples} samples at this file's ~${nominalSpacingMs.toFixed(1)}ms spacing).`);
+    } else {
+      console.log(`  Yaw/pitch smoothing disabled (--smooth-angles 0).`);
+    }
     if (emptyColumns.length > 0) {
       console.log(`  Note: these columns were empty across every packet: ${emptyColumns.join(", ")}`);
     }

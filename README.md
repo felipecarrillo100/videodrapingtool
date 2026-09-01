@@ -35,7 +35,21 @@ Options:
   --crf <n>               ffmpeg -crf for the re-encode — lower = higher quality, larger file (default: "28")
   --preset <name>         ffmpeg -preset for the re-encode — slower = smaller file at the same -crf (default: "slow")
   --fps <n>               frame rate for the re-encode (default: "30")
+  --smooth-angles <ms>    smooths yaw/pitch to remove sensor-update artifacts ("beating") — raise if
+                          beating persists, set to 0 to disable (default: "120")
 ```
+
+**On `--smooth-angles`**: some sources' `Sensor Latitude/Longitude` and `Frame Center Latitude/Longitude`
+(the two positions `yaw`/`pitch` are derived from when a packet has no `Target Location`) are sampled by
+independent onboard subsystems, each holding its last value between its own real updates, on cadences that
+aren't in phase with each other. Recomputing the bearing between them fresh on every packet then produces
+a real, rhythmic "beating" — the derived angle swings away from the true trend and snaps back every time
+one field updates before the other catches up, confirmed on a real customer file (~5Hz, up to ~1°/step).
+This flag applies a windowed median filter to `yaw`/`pitch` only (not `roll`, not position — neither shows
+this artifact) to remove it, on by default since it's a strict improvement with no observed downside on
+sources that don't exhibit the artifact. The window is in milliseconds, not a raw sample count, so it
+means the same real time span regardless of a source's native packet rate; pass `0` to compare against raw
+values.
 
 **On the defaults**: the source video's own codec is typically already H.264 — re-encoding to H.264 again
 doesn't shrink anything on its own, only the bitrate/CRF/framerate choices do. Measured on the real sample
