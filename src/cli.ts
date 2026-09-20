@@ -26,7 +26,12 @@ program
   .argument("<input-video>", "path to the source video (an MPEG-TS file with an embedded KLV data track)")
   .requiredOption("-o, --output <dir>", "output directory — created if it doesn't exist")
   .option("--variant <name>", "the video.json \"variant\" field", "stanag-4609")
-  .option("--sync-offset <ms>", "the video.json \"syncOffsetMs\" field, if the video and telemetry need a manual nudge", "0")
+  .option(
+    "--video-start <iso>",
+    "the video.json \"videoStartUtc\" field — the UTC instant of video t=0. Defaults to the first " +
+      "telemetry sample's own instant, which assumes the video begins where the telemetry does; override " +
+      "when it does not (the KLV track carries no presentation timestamps, so this cannot be measured)",
+  )
   .option("--crf <n>", "ffmpeg -crf for the re-encode (lower = higher quality, larger file)", "28")
   .option("--preset <name>", "ffmpeg -preset for the re-encode (slower = smaller file at the same -crf)", "slow")
   .option(
@@ -51,7 +56,7 @@ program
       "  $ videodrapingtool samples/internal.ts -o out/internal --smooth-angles 0     # disable, compare against raw values\n" +
       "  $ videodrapingtool samples/internal.ts -o out/internal --no-collapse-held-position   # keep raw per-packet position rows\n\n" +
       `Produces, in the given output directory:\n  ${VIDEO_FILENAME}        size-optimized re-encode of the source video\n` +
-      `  ${TELEMETRY_FILENAME}    one row per decoded KLV packet: timestampMs,lon,lat,height,yaw,pitch,roll,fovX,fovY,targetLon,targetLat,targetElevation\n` +
+      `  ${TELEMETRY_FILENAME}    one row per decoded KLV packet: unixMs,lon,lat,height,yaw,pitch,roll,fovX,fovY,targetLon,targetLat,targetElevation\n` +
       `  ${MANIFEST_FILENAME}       manifest pointing at the two files above\n`,
   )
   .action((inputVideo: string, opts) => {
@@ -66,7 +71,7 @@ async function run(
   opts: {
     output: string;
     variant: string;
-    syncOffset: string;
+    videoStart?: string;
     crf: string;
     preset: string;
     fps: string;
@@ -120,15 +125,22 @@ async function run(
     });
 
     console.log("Writing video.json...");
+    // Defaults to the first sample's own instant — the same "the video starts where the telemetry starts"
+    // assumption the relative timestamps used to bake into every row, now stated once where it can be
+    // corrected without regenerating anything.
+    const videoStartUtc = opts.videoStart ?? new Date(finalRows[0]!.unixMs).toISOString();
     writeManifest(join(outputDir, MANIFEST_FILENAME), {
       variant: opts.variant,
       videoFilename: VIDEO_FILENAME,
       telemetryFilename: TELEMETRY_FILENAME,
-      syncOffsetMs: Number(opts.syncOffset),
+      videoStartUtc,
     });
 
     const videoSize = statSync(join(outputDir, VIDEO_FILENAME)).size;
-    console.log(`\nDone. ${finalRows.length} telemetry samples decoded, spanning ${(finalRows.at(-1)?.timestampMs ?? 0) / 1000}s.`);
+    const spanMs = finalRows.length > 1 ? finalRows.at(-1)!.unixMs - finalRows[0]!.unixMs : 0;
+    console.log(`\nDone. ${finalRows.length} telemetry samples decoded, spanning ${spanMs / 1000}s.`);
+    console.log(`  ${new Date(finalRows[0]!.unixMs).toISOString()} -> ${new Date(finalRows.at(-1)!.unixMs).toISOString()}`);
+    console.log(`  videoStartUtc: ${videoStartUtc}${opts.videoStart ? " (from --video-start)" : " (first sample)"}`);
     console.log(`  ${VIDEO_FILENAME}: ${(videoSize / 1024 / 1024).toFixed(1)} MB`);
     if (skippedCount > 0) {
       console.log(`  Skipped ${skippedCount} non-positional packet(s) (no Sensor Latitude/Longitude) sharing a timestamp with a real sample.`);
@@ -139,7 +151,7 @@ async function run(
       console.log(`  Yaw/pitch smoothing disabled (--smooth-angles 0).`);
     }
     if (heldPositionCount > 0) {
-      const avgSpacingMs = finalRows.length > 1 ? finalRows.at(-1)!.timestampMs / finalRows.length : 0;
+      const avgSpacingMs = finalRows.length > 1 ? spanMs / finalRows.length : 0;
       console.log(`  Collapsed ${heldPositionCount} held-position packet(s) into their real update boundaries (~${avgSpacingMs.toFixed(0)}ms avg spacing).`);
     } else if (!opts.collapseHeldPosition) {
       console.log(`  Held-position collapsing disabled (--no-collapse-held-position).`);

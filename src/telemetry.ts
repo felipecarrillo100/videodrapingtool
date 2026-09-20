@@ -13,7 +13,20 @@
 import { numericField, type St0601Packet } from "./klv.js";
 
 export interface TelemetryRow {
-  readonly timestampMs: number;
+  /**
+   * When this sample was measured: milliseconds since the UNIX epoch, UTC, fractional.
+   *
+   * Straight from MISB's `Precision Time Stamp` (ST 0601 tag 2), microsecond resolution preserved as a
+   * fractional millisecond. **The only time column this format has.** It replaced a relative
+   * `timestampMs` (offsets from the first packet), which was exactly `unixMs[i] - unixMs[0]` — derivable,
+   * and it hid the "normalise the first packet to zero" convention inside the data. Where the video's own
+   * timeline sits on this one is a single fact about the recording, and lives in the manifest's
+   * `videoStartUtc` instead of being multiplied across every row.
+   *
+   * Absolute time is what lets a consumer drive playback from either the video's clock or a world clock,
+   * put two flights on one timeline, or simply show a date.
+   */
+  readonly unixMs: number;
   readonly lon: number;
   readonly lat: number;
   readonly height: number;
@@ -144,20 +157,31 @@ export function isPositionalPacket(packet: St0601Packet): boolean {
   return numericField(packet, "Sensor Latitude") !== undefined && numericField(packet, "Sensor Longitude") !== undefined;
 }
 
-/** One row per (positional) packet, timestamps normalized so the FIRST packet is `timestampMs: 0` —
- * matching the `"dji"` variant's own CSV convention (a relative offset, not a UNIX epoch value) exactly,
- * so the app-side decoder pattern this eventually feeds transfers directly. */
+/** One row per (positional) packet, timed absolutely — see {@link TelemetryRow.unixMs}.
+ *
+ * Throws if any positional packet lacks `Precision Time Stamp`. With one time column there is nothing to
+ * fall back on: a blank cell would make the row untimed, and substituting zero would place it at
+ * 1 January 1970, indistinguishable from real data. Failing here, naming the count, beats writing a file
+ * the consumer has to reject. */
 export function buildTelemetryRows(packets: readonly St0601Packet[]): TelemetryRow[] {
   const positional = packets.filter(isPositionalPacket);
-  const rawTimestamps = positional.map((p) => numericField(p, "Precision Time Stamp") ?? 0);
-  const firstTimestampUs = rawTimestamps[0] ?? 0;
+  const rawTimestampsUs = positional.map((p) => numericField(p, "Precision Time Stamp"));
+  const untimed = rawTimestampsUs.filter((us) => us === undefined).length;
+  if (untimed > 0) {
+    throw new Error(
+      `${untimed} of ${positional.length} positional packet(s) carry no "Precision Time Stamp" (MISB ST 0601 ` +
+        "tag 2), so they cannot be timed. That tag is what this format's only time column is built from.",
+    );
+  }
 
   return positional.map((packet, i) => {
     const { yaw, pitch } = deriveYawPitch(packet);
     const platformRoll = numericField(packet, "Platform Roll Angle") ?? 0;
     const sensorRelRoll = numericField(packet, "Sensor Relative Roll Angle") ?? 0;
     return {
-      timestampMs: (rawTimestamps[i]! - firstTimestampUs) / 1000,
+      // Microseconds in the source, so the division keeps the sub-millisecond part rather than rounding it
+      // away. Non-null asserted because the guard above rejected the whole run if any were missing.
+      unixMs: rawTimestampsUs[i]! / 1000,
       lon: numericField(packet, "Sensor Longitude") ?? 0,
       lat: numericField(packet, "Sensor Latitude") ?? 0,
       height: numericField(packet, "Sensor True Altitude") ?? 0,
@@ -227,7 +251,7 @@ export interface SmoothAnglesResult {
 export function smoothAngles(rows: readonly TelemetryRow[], windowMs: number): SmoothAnglesResult {
   if (rows.length < 3 || windowMs <= 0) return { rows, windowSamples: 1, nominalSpacingMs: 0 };
 
-  const deltas = rows.slice(1).map((r, i) => r.timestampMs - rows[i]!.timestampMs).filter((d) => d > 0);
+  const deltas = rows.slice(1).map((r, i) => r.unixMs - rows[i]!.unixMs).filter((d) => d > 0);
   const nominalSpacingMs = deltas.length > 0 ? median(deltas) : 20;
   let windowSamples = Math.round(windowMs / nominalSpacingMs);
   if (windowSamples % 2 === 0) windowSamples += 1; // median needs an odd, well-defined middle element

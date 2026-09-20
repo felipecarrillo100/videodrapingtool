@@ -31,7 +31,8 @@ npx tsx src/cli.ts <input-video> -o <output-dir> [options]
 Options:
   -o, --output <dir>      output directory — created if it doesn't exist (required)
   --variant <name>        the video.json "variant" field (default: "stanag-4609")
-  --sync-offset <ms>      the video.json "syncOffsetMs" field (default: "0")
+  --video-start <iso>     the video.json "videoStartUtc" field — the UTC instant of video t=0
+                          (default: the first telemetry sample's own instant)
   --crf <n>               ffmpeg -crf for the re-encode — lower = higher quality, larger file (default: "28")
   --preset <name>         ffmpeg -preset for the re-encode — slower = smaller file at the same -crf (default: "slow")
   --fps <n>               frame rate for the re-encode (default: "30")
@@ -40,6 +41,26 @@ Options:
   --no-collapse-held-position   keep one row per decoded packet even when position hasn't changed
                           (disables the fix below, for comparison/debugging)
 ```
+
+## Converting a DJI flight log
+
+A second entry point, for the other source this format has to cover: a DJI recording plus its Flight
+Reader CSV export. It writes the same canonical `telemetry.csv` + `video.json`, so a consumer reads one
+format rather than one per source, and it does **no video work at all** — a DJI recording is already an
+ordinary mp4, so the manifest simply points at whatever is already there.
+
+```bash
+npx tsx src/cliDji.ts <flight-reader.csv> -o <dir> --video <filename> [--icon-mesh <filename>]
+```
+
+**Absolute time is reconstructed, not read.** A Flight Reader export has two time columns and neither is
+sufficient alone: `time(millisecond)` is precise but has no date, and `datetime(utc)` has the date at
+WHOLE-SECOND resolution — ten rows of a 10 Hz log share one value. So the converter finds the rows where
+`datetime(utc)` ticks over, computes `wholeSecond − time(millisecond)` at each tick, takes the **median**
+of those (real logs drop samples: one tick in `luciad.csv` lands 1100 ms after its neighbour rather than
+1000), and adds the log's own millisecond offsets back on. That places the track within about one sample
+of true UTC, where parsing `datetime(utc)` per row would have quantised a 10 Hz track to 1 Hz — a drone
+that jumps once a second.
 
 **On `--smooth-angles`**: some sources' `Sensor Latitude/Longitude` and `Frame Center Latitude/Longitude`
 (the two positions `yaw`/`pitch` are derived from when a packet has no `Target Location`) are sampled by
@@ -97,7 +118,34 @@ Given `-o out/day-flight`, produces:
 |---|---|
 | `out/day-flight/video.mp4` | Size-optimized re-encode of the source footage (video only — audio is dropped; irrelevant for map draping). |
 | `out/day-flight/telemetry.csv` | One row per decoded KLV packet. Columns below. |
-| `out/day-flight/video.json` | `{ type: "videopanorama", variant: "stanag-4609", videoUrl: "./video.mp4", telemetryUrl: "./telemetry.csv", syncOffsetMs: 0 }` |
+| `out/day-flight/video.json` | `{ type: "videopanorama", variant: "stanag-4609", videoUrl: "./video.mp4", telemetryUrl: "./telemetry.csv", videoStartUtc: "2009-06-17T16:53:05.099Z" }` |
+
+### Time: one column, one anchor
+
+Two facts, stored once each:
+
+- **`unixMs`, per row** — when the sample was measured, in world time.
+- **`videoStartUtc`, in the manifest** — the world instant of video `t=0`.
+
+Everything else about time is derived from those. A consumer can therefore drive the same telemetry from
+either clock, from the same data:
+
+```
+video-driven:  sampleAt(videoStartUtc + video.currentTime * 1000)
+clock-driven:  sampleAt(worldClockInstant)
+```
+
+This replaced a relative `timestampMs` column plus a `syncOffsetMs` manifest field. The column was exactly
+`unixMs[i] - unixMs[0]` — derivable, and it hid the "normalise the first packet to zero" convention inside
+the data — while `syncOffsetMs` said what `videoStartUtc` says, in units the format no longer has. Storing
+absolute time per row also means the telemetry stays true if the video is trimmed or re-encoded (only the
+anchor changes), and that two clips from one sortie can share one telemetry file.
+
+`videoStartUtc` defaults to the first sample's own instant, i.e. "the video begins where the telemetry
+does". **That is an assumption, not a measurement**: the KLV track in an MPEG-TS carries no presentation
+timestamps (`ffprobe -select_streams d:0 -show_entries packet=pts_time` returns `N/A` for every packet), so
+where packet 0 sits in video time cannot be read from the file. `--video-start <iso>` overrides it, and
+because it is one value in the manifest, correcting it never means regenerating the CSV.
 
 ### `telemetry.csv` schema
 
@@ -107,7 +155,7 @@ actual contract a future STANAG decoder in the consuming app needs to target.
 
 | Column | Meaning |
 |---|---|
-| `timestampMs` | Milliseconds since the FIRST decoded packet (relative, not a UNIX timestamp) — matches the same relative-offset convention the existing `"dji"` variant's own CSV already uses. |
+| `unixMs` | **When this sample was measured**: milliseconds since the UNIX epoch, UTC, fractional — straight from `Precision Time Stamp` (ST 0601 tag 2), microsecond resolution preserved. Ascending, and the only time column this format has. A packet without tag 2 fails the run rather than producing an untimed row. |
 | `lon`, `lat` | Sensor position (WGS84 degrees) — from MISB's `Sensor Longitude`/`Sensor Latitude` tags. |
 | `height` | Sensor altitude, metres — from `Sensor True Altitude`. |
 | `yaw`, `pitch` | **Absolute** sensor pointing angles, degrees (`yaw` wrapped to 0–360°). Computed from two independent *positions* — `Sensor Latitude/Longitude/True Altitude` and `Target Location Latitude/Longitude/Elevation` — as the bearing and depression angle from one to the other, **not** by composing MISB's `Platform Heading/Pitch/Roll` with `Sensor Relative Azimuth/Elevation/Roll`. That angle-composition approach was tried first (plain addition, then full DCM rotation composition) and both were proven wrong on this tool's own real sample: extracting real video frames and reading the sensor's own on-screen HUD directly showed its printed `LOS` bearing matches raw `Sensor Relative Azimuth Angle` ALONE (platform heading plays no role at all in this file), and the geometrically-required depression angle didn't match any angle-composition attempt either. Falls back to `yaw = Sensor Relative Azimuth Angle` / `pitch = Sensor Relative Elevation Angle` directly when a packet doesn't report target location — untested against real data, since every packet in our sample does report it. |

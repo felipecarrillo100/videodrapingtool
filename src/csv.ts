@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import type { TelemetryRow } from "./telemetry.js";
 
 const COLUMNS = [
-  "timestampMs",
+  "unixMs",
   "lon",
   "lat",
   "height",
